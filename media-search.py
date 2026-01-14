@@ -28,8 +28,13 @@ def load_hosts():
     return json.loads(CONFIG_FILE.read_text())["hosts"]
 
 
-def get_collection():
-    client = chromadb.PersistentClient(path=str(DB_PATH))
+def get_client():
+    return chromadb.PersistentClient(path=str(DB_PATH))
+
+
+def get_collection(client=None):
+    if client is None:
+        client = get_client()
     return client.get_or_create_collection("media")
 
 
@@ -41,10 +46,14 @@ def cmd_hosts(args):
 
 def cmd_index(args):
     hosts = load_hosts()
-    collection = get_collection()
+    client = get_client()
 
-    # Clear existing
-    collection.delete(where={})
+    # Clear existing by deleting and recreating collection
+    try:
+        client.delete_collection("media")
+    except ValueError:
+        pass  # Collection doesn't exist yet
+    collection = client.create_collection("media")
 
     all_files = []
     for host in hosts:
