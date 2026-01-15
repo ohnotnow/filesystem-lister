@@ -118,6 +118,37 @@ uv run ./media-search.py search "query" -n 20  # Return more results
 | `GET /list` | List all files |
 | `GET /filter?q=*pattern*` | Filter files (DOS-style wildcards: `*word*`, `word*`, `*.mkv`) |
 
+## Building the Go Server Locally
+
+If you're not using a pre-built release binary, you can build it yourself:
+
+```bash
+cd filesystem-lister
+go build -o filesystem-lister .
+```
+
+Or to cross-compile for another platform (e.g., Raspberry Pi):
+
+```bash
+GOOS=linux GOARCH=arm64 go build -o filesystem-lister-linux-arm64 .
+```
+
+Don't forget to rebuild after making changes - a classic gotcha!
+
+## How Indexing Works
+
+The system uses a version-based approach to avoid unnecessary re-indexing:
+
+1. **Server-side SHA**: The Go server computes a SHA256 hash of all file paths it's serving. This hash is returned in the `/health` endpoint as the `version` field.
+
+2. **Client-side caching**: The Python CLI stores the last-seen version for each host in ChromaDB's collection metadata.
+
+3. **Smart sync**: When you run `index`, the CLI checks each host's current version against the stored version. If they match, that host is skipped. If they differ (files added/removed), it fetches the full listing and syncs.
+
+4. **Diff-based updates**: When syncing, the CLI compares the server's file list against what's already indexed, only adding new files and removing deleted ones.
+
+This means after the initial index, subsequent runs are fast - only hosts with actual changes get re-indexed.
+
 ## Requirements
 
 - **Go servers**: Go 1.24+ to build, or just download a binary

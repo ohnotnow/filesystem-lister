@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 )
 
@@ -74,7 +76,11 @@ func main() {
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok", "host": config.FriendlyName})
+	json.NewEncoder(w).Encode(map[string]string{
+		"status":  "ok",
+		"host":    config.FriendlyName,
+		"version": computeVersion(),
+	})
 }
 
 func handleList(w http.ResponseWriter, r *http.Request) {
@@ -175,4 +181,30 @@ func matchPattern(name, pattern string) bool {
 	default:
 		return name == pattern
 	}
+}
+
+// computeVersion returns a hash of all file paths in the configured directories.
+// The hash changes when files are added or removed.
+func computeVersion() string {
+	var paths []string
+
+	for _, dir := range config.Dirs {
+		filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() {
+				return nil
+			}
+			paths = append(paths, path)
+			return nil
+		})
+	}
+
+	sort.Strings(paths)
+
+	h := sha256.New()
+	for _, p := range paths {
+		h.Write([]byte(p))
+		h.Write([]byte{0}) // null separator
+	}
+
+	return fmt.Sprintf("sha256:%x", h.Sum(nil))
 }

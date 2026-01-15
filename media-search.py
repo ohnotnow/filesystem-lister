@@ -3,9 +3,10 @@
 Media search CLI - queries filesystem-lister instances and searches semantically.
 
 Usage:
-    ./media-search.py index          # Fetch from all hosts and index
-    ./media-search.py search "query" # Search the index
-    ./media-search.py hosts          # List configured hosts
+    ./media-search.py index           # Sync from hosts (only if changed)
+    ./media-search.py index --force   # Force sync even if versions match
+    ./media-search.py search "query"  # Search the index
+    ./media-search.py hosts           # List configured hosts
 """
 
 import argparse
@@ -38,6 +39,67 @@ def get_collection(client=None):
     return client.get_or_create_collection("media")
 
 
+def get_stored_versions(collection) -> dict[str, str]:
+    """Get stored versions from collection metadata."""
+    meta = collection.metadata or {}
+    versions_json = meta.get("versions", "{}")
+    return json.loads(versions_json)
+
+
+def store_versions(collection, versions: dict[str, str]):
+    """Store versions in collection metadata (serialized as JSON string)."""
+    collection.modify(metadata={"versions": json.dumps(versions)})
+
+
+def fetch_host_version(host: dict) -> str | None:
+    """Fetch version from a host's health endpoint."""
+    try:
+        resp = httpx.get(f"{host['url']}/health", timeout=5)
+        resp.raise_for_status()
+        return resp.json().get("version")
+    except Exception as e:
+        print(f"  Warning: Could not fetch version from {host['name']}: {e}")
+        return None
+
+
+def sync_host(collection, host: dict, files: list[dict]) -> tuple[int, int]:
+    """
+    Sync files from a host using smart diffing.
+    Returns (added_count, removed_count).
+    """
+    # Build set of IDs from server
+    server_ids = {f"{host['name']}:{f['path']}" for f in files}
+
+    # Get existing IDs for this host from ChromaDB
+    existing = collection.get(
+        where={"host": host["name"]},
+        include=[]  # We only need IDs
+    )
+    existing_ids = set(existing["ids"])
+
+    # Compute diff
+    to_add_ids = server_ids - existing_ids
+    to_remove_ids = existing_ids - server_ids
+
+    # Remove deleted files
+    if to_remove_ids:
+        collection.delete(ids=list(to_remove_ids))
+
+    # Add new files
+    if to_add_ids:
+        # Build file lookup for new files
+        files_by_id = {f"{host['name']}:{f['path']}": f for f in files}
+        new_files = [files_by_id[id] for id in to_add_ids]
+
+        collection.add(
+            ids=[f"{host['name']}:{f['path']}" for f in new_files],
+            documents=[f["name"] for f in new_files],
+            metadatas=[{"path": f["path"], "host": host["name"]} for f in new_files],
+        )
+
+    return len(to_add_ids), len(to_remove_ids)
+
+
 def cmd_hosts(args):
     hosts = load_hosts()
     for h in hosts:
@@ -47,42 +109,68 @@ def cmd_hosts(args):
 def cmd_index(args):
     hosts = load_hosts()
     client = get_client()
+    collection = get_collection(client)
 
-    # Clear existing by deleting and recreating collection
-    try:
-        client.delete_collection("media")
-    except ValueError:
-        pass  # Collection doesn't exist yet
-    collection = client.create_collection("media")
+    if getattr(args, "force", False):
+        print("Force mode: ignoring versions, syncing all hosts")
+        stored_versions = {}
+    else:
+        stored_versions = get_stored_versions(collection)
 
-    all_files = []
+    new_versions = {}
+    total_added = 0
+    total_removed = 0
+    hosts_updated = 0
+    hosts_skipped = 0
+
     for host in hosts:
-        print(f"Fetching from {host['name']}...")
+        print(f"Checking {host['name']}...")
+
+        # Fetch current version
+        current_version = fetch_host_version(host)
+        if current_version is None:
+            print(f"  Skipping (could not connect)")
+            # Keep old version if we had one
+            if host["name"] in stored_versions:
+                new_versions[host["name"]] = stored_versions[host["name"]]
+            continue
+
+        stored_version = stored_versions.get(host["name"])
+
+        # Check if update needed
+        if current_version == stored_version:
+            print(f"  No changes (version: {current_version[:20]}...)")
+            new_versions[host["name"]] = current_version
+            hosts_skipped += 1
+            continue
+
+        # Fetch full file list
+        print(f"  Changes detected, fetching files...")
         try:
             resp = httpx.get(f"{host['url']}/list", timeout=30)
             resp.raise_for_status()
             data = resp.json()
-            for f in data["files"]:
-                all_files.append({
-                    "id": f"{host['name']}:{f['path']}",
-                    "name": f["name"],
-                    "path": f["path"],
-                    "host": host["name"],
-                })
+            files = [{"name": f["name"], "path": f["path"]} for f in data["files"]]
         except Exception as e:
-            print(f"  Error: {e}")
+            print(f"  Error fetching files: {e}")
+            continue
 
-    if not all_files:
-        print("No files found")
-        return
+        # Sync using diff
+        added, removed = sync_host(collection, host, files)
+        print(f"  Synced: +{added} -{removed} files")
 
-    print(f"Indexing {len(all_files)} files...")
-    collection.add(
-        ids=[f["id"] for f in all_files],
-        documents=[f["name"] for f in all_files],
-        metadatas=[{"path": f["path"], "host": f["host"]} for f in all_files],
-    )
-    print("Done")
+        new_versions[host["name"]] = current_version
+        total_added += added
+        total_removed += removed
+        hosts_updated += 1
+
+    # Store updated versions
+    store_versions(collection, new_versions)
+
+    # Summary
+    print()
+    print(f"Done: {hosts_updated} hosts updated, {hosts_skipped} skipped")
+    print(f"Total: +{total_added} added, -{total_removed} removed")
 
 
 def cmd_search(args):
@@ -114,7 +202,11 @@ def main():
     subs = parser.add_subparsers(dest="command", required=True)
 
     subs.add_parser("hosts", help="List configured hosts")
-    subs.add_parser("index", help="Fetch and index from all hosts")
+    index_parser = subs.add_parser("index", help="Fetch and index from all hosts")
+    index_parser.add_argument(
+        "-f", "--force", action="store_true",
+        help="Force re-sync even if versions match"
+    )
 
     search = subs.add_parser("search", help="Search the index")
     search.add_argument("query", help="Search query")

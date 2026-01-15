@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -48,7 +49,11 @@ func TestMatchPattern(t *testing.T) {
 }
 
 func TestHandleHealth(t *testing.T) {
+	tmpDir := t.TempDir()
+	os.WriteFile(filepath.Join(tmpDir, "test.mkv"), []byte("test"), 0644)
+
 	config.FriendlyName = "test-host"
+	config.Dirs = []string{tmpDir}
 
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	w := httptest.NewRecorder()
@@ -67,6 +72,53 @@ func TestHandleHealth(t *testing.T) {
 	}
 	if resp["host"] != "test-host" {
 		t.Errorf("expected host test-host, got %s", resp["host"])
+	}
+	if resp["version"] == "" {
+		t.Error("expected version in health response")
+	}
+	if !strings.HasPrefix(resp["version"], "sha256:") {
+		t.Errorf("expected version to start with sha256:, got %s", resp["version"])
+	}
+}
+
+func TestVersionChangesWhenFilesChange(t *testing.T) {
+	tmpDir := t.TempDir()
+	os.WriteFile(filepath.Join(tmpDir, "file1.mkv"), []byte("test"), 0644)
+	config.Dirs = []string{tmpDir}
+
+	v1 := computeVersion()
+
+	// Add a new file
+	os.WriteFile(filepath.Join(tmpDir, "file2.mkv"), []byte("test2"), 0644)
+	v2 := computeVersion()
+
+	if v1 == v2 {
+		t.Error("version should change when files are added")
+	}
+
+	// Remove a file
+	os.Remove(filepath.Join(tmpDir, "file2.mkv"))
+	v3 := computeVersion()
+
+	if v2 == v3 {
+		t.Error("version should change when files are removed")
+	}
+	if v1 != v3 {
+		t.Error("version should be the same when files are restored to original state")
+	}
+}
+
+func TestVersionIsDeterministic(t *testing.T) {
+	tmpDir := t.TempDir()
+	os.WriteFile(filepath.Join(tmpDir, "a.mkv"), []byte("test"), 0644)
+	os.WriteFile(filepath.Join(tmpDir, "b.mkv"), []byte("test"), 0644)
+	config.Dirs = []string{tmpDir}
+
+	v1 := computeVersion()
+	v2 := computeVersion()
+
+	if v1 != v2 {
+		t.Error("version should be deterministic for same file set")
 	}
 }
 
